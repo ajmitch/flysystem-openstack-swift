@@ -4,24 +4,56 @@ namespace Nimbusoft\Flysystem\OpenStack;
 
 use GuzzleHttp\Psr7\Stream;
 use GuzzleHttp\Psr7\StreamWrapper;
-use League\Flysystem\Util;
 use League\Flysystem\Config;
-use League\Flysystem\Adapter\AbstractAdapter;
+use League\Flysystem\DirectoryAttributes;
+use League\Flysystem\FileAttributes;
+use League\Flysystem\FilesystemAdapter;
+use League\Flysystem\FilesystemException;
+use League\Flysystem\FilesystemOperationFailed;
+use League\Flysystem\InvalidVisibilityProvided;
+use League\Flysystem\PathPrefixer;
+use League\Flysystem\StorageAttributes;
+use League\Flysystem\UnableToCheckFileExistence;
+use League\Flysystem\UnableToCopyFile;
+use League\Flysystem\UnableToCreateDirectory;
+use League\Flysystem\UnableToDeleteDirectory;
+use League\Flysystem\UnableToDeleteFile;
+use League\Flysystem\UnableToMoveFile;
+use League\Flysystem\UnableToReadFile;
+use League\Flysystem\UnableToRetrieveMetadata;
+use League\Flysystem\UnableToSetVisibility;
+use League\Flysystem\UnableToWriteFile;
+use League\Flysystem\UnixVisibility\PortableVisibilityConverter;
+use League\Flysystem\UnixVisibility\VisibilityConverter;
+use League\Flysystem\Visibility;
+use League\MimeTypeDetection\FinfoMimeTypeDetector;
+use League\MimeTypeDetection\MimeTypeDetector;
 use OpenStack\Common\Error\BadResponseError;
 use OpenStack\ObjectStore\v1\Models\Container;
 use OpenStack\ObjectStore\v1\Models\StorageObject;
-use League\Flysystem\Adapter\Polyfill\NotSupportingVisibilityTrait;
-use League\Flysystem\Adapter\Polyfill\StreamedCopyTrait;
 
-class SwiftAdapter extends AbstractAdapter
+class SwiftAdapter implements FilesystemAdapter
 {
-    use StreamedCopyTrait;
-    use NotSupportingVisibilityTrait;
 
     /**
      * @var Container
      */
-    protected $container;
+    protected Container $container;
+
+    /**
+     * @var PathPrefixer
+     */
+    private PathPrefixer $prefixer;
+
+    /**
+     * @var PortableVisibilityConverter|VisibilityConverter
+     */
+    private $visibility;
+
+    /**
+     * @var FinfoMimeTypeDetector|MimeTypeDetector
+     */
+    private $mimeTypeDetector;
 
     /**
      * Constructor
@@ -29,18 +61,25 @@ class SwiftAdapter extends AbstractAdapter
      * @param Container $container
      * @param string    $prefix
      */
-    public function __construct(Container $container, $prefix = null)
+    public function __construct(Container $container,
+                                VisibilityConverter $visibility = null,
+                                MimeTypeDetector $mimeTypeDetector = null,
+                                $prefix = null)
     {
-        $this->setPathPrefix($prefix);
+        $this->prefixer = new PathPrefixer($prefix);
         $this->container = $container;
+        $this->visibility = $visibility ?: new PortableVisibilityConverter();
+        $this->mimeTypeDetector = $mimeTypeDetector ?: new FinfoMimeTypeDetector();
     }
 
     /**
      * {@inheritdoc}
      */
-    public function write($path, $contents, Config $config, $size = 0)
+    public function write($path, $contents, Config $config): void
     {
-        $path = $this->applyPathPrefix($path);
+        $path = $this->prefixer->prefixPath($path);
+        // FIXME a size was passed in, is it efficient to get the size of a large $contents?
+        $size = 0;
 
         $data = $this->getWriteData($path, $config);
         $type = 'content';
@@ -63,67 +102,48 @@ class SwiftAdapter extends AbstractAdapter
             $response = $this->container->createObject($data);
         }
 
-        return $this->normalizeObject($response);
+        //return $this->normalizeObject($response);
     }
 
     /**
      * {@inheritdoc}
      */
-    public function writeStream($path, $resource, Config $config)
+    public function writeStream($path, $resource, Config $config): void
     {
-        return $this->write($path, new Stream($resource), $config, Util::getStreamSize($resource));
+        // No more getStreamSize
+        $this->write($path, new Stream($resource), $config);
     }
 
     /**
      * {@inheritdoc}
      */
-    public function update($path, $contents, Config $config)
-    {
-        return $this->write($path, $contents, $config);
-    }
-
-    /**
-     * {@inheritdoc}
-     */
-    public function updateStream($path, $resource, Config $config)
-    {
-        return $this->write($path, new Stream($resource), $config, Util::getStreamSize($resource));
-    }
-
-    /**
-     * {@inheritdoc}
-     */
-    public function rename($path, $newpath)
+    public function move(string $path, string $newpath, Config $config): void
     {
         $object = $this->getObject($path);
-        $newLocation = $this->applyPathPrefix($newpath);
+        $newLocation = $this->prefixer->prefixPath($newpath);
         $destination = '/'.$this->container->name.'/'.ltrim($newLocation, '/');
 
         try {
-            $response = $object->copy(compact('destination'));
+            $object->copy(compact('destination'));
         } catch (BadResponseError $e) {
-            return false;
+            throw UnableToMoveFile::fromLocationTo($path, $newpath);
         }
 
         $object->delete();
-
-        return true;
     }
 
     /**
      * {@inheritdoc}
      */
-    public function delete($path)
+    public function delete($path): void
     {
         $object = $this->getObjectInstance($path);
 
         try {
             $object->delete();
         } catch (BadResponseError $e) {
-            return false;
+            throw UnableToDeleteFile::atLocation($path);
         }
-
-        return true;
     }
 
     /**
@@ -140,7 +160,7 @@ class SwiftAdapter extends AbstractAdapter
         }
 
         $objects = $this->container->listObjects([
-            'prefix' => $this->applyPathPrefix($dirname)
+            'prefix' => $this->prefixer->prefixPath($dirname)
         ]);
 
         try {
@@ -153,14 +173,6 @@ class SwiftAdapter extends AbstractAdapter
         }
 
         return true;
-    }
-
-    /**
-     * {@inheritdoc}
-     */
-    public function createDir($dirname, Config $config)
-    {
-        return ['path' => $dirname];
     }
 
     /**
@@ -184,16 +196,14 @@ class SwiftAdapter extends AbstractAdapter
     /**
      * {@inheritdoc}
      */
-    public function read($path)
+    public function read($path): string
     {
         $object = $this->getObject($path);
         $data = $this->normalizeObject($object);
 
         $stream = $object->download();
         $stream->rewind();
-        $data['contents'] = $stream->getContents();
-
-        return $data;
+        return $stream->getContents();
     }
 
     /**
@@ -214,17 +224,18 @@ class SwiftAdapter extends AbstractAdapter
     /**
      * {@inheritdoc}
      */
-    public function listContents($directory = '', $recursive = false)
+    public function listContents($path = '', $deep = false): iterable
     {
-        $location = $this->applyPathPrefix($directory);
+        // AWS adapter uses generators to yield results
+        $location = $this->prefixer->prefixPath($path);
 
         $objectList = $this->container->listObjects([
-            'prefix' => $directory
+            'prefix' => $location
         ]);
 
-        $response = iterator_to_array($objectList);
-
-        return Util::emulateDirectories(array_map([$this, 'normalizeObject'], $response));
+        foreach($objectList as $object) {
+            yield $this->normalizeObject($object);
+        }
     }
 
     /**
@@ -240,7 +251,7 @@ class SwiftAdapter extends AbstractAdapter
     /**
      * {@inheritdoc}
      */
-    public function getSize($path)
+    public function fileSize($path): FileAttributes
     {
         return $this->getMetadata($path);
     }
@@ -283,7 +294,7 @@ class SwiftAdapter extends AbstractAdapter
      */
     protected function getObjectInstance($path)
     {
-        $location = $this->applyPathPrefix($path);
+        $location = $this->prefixer->prefixPath($path);
 
         $object = $this->container->getObject($location);
 
@@ -311,9 +322,9 @@ class SwiftAdapter extends AbstractAdapter
      * @param StorageObject $object
      * @return array
      */
-    protected function normalizeObject(StorageObject $object)
+    protected function normalizeObject(StorageObject $object): FileAttributes
     {
-        $name = $this->removePathPrefix($object->name);
+        $name = $this->prefixer->stripPrefix($object->name);
         $mimetype = explode('; ', $object->contentType);
 
         if ($object->lastModified instanceof \DateTimeInterface) {
@@ -322,13 +333,75 @@ class SwiftAdapter extends AbstractAdapter
             $timestamp = strtotime($object->lastModified);
         }
 
-        return [
+        $attribs = [
             'type'      => 'file',
-            'dirname'   => Util::dirname($name),
+            'dirname'   => $this->prefixer->prefixPath($object->name),
             'path'      => $name,
             'timestamp' => $timestamp,
             'mimetype'  => reset($mimetype),
             'size'      => $object->contentLength,
         ];
+        return new FileAttributes($name, $object->contentLength, null, $timestamp, $object->contentType );
+    }
+
+    public function fileExists(string $path): bool
+    {
+        try {
+            return $this->container->objectExists($this->prefixer->prefixPath($path));
+        } catch (\Throwable $exception) {
+            throw UnableToCheckFileExistence::forLocation($path, $exception);
+        }
+    }
+
+    public function deleteDirectory(string $path): void
+    {
+        // TODO: Implement deleteDirectory() method.
+        throw UnableToDeleteDirectory::atLocation($path);
+    }
+
+    public function createDirectory(string $path, Config $config): void
+    {
+        // Directories are implicitly created
+    }
+
+    public function setVisibility(string $path, string $visibility): void
+    {
+        // TODO: Implement setVisibility() method.
+        UnableToSetVisibility::atLocation($path);
+
+    }
+
+    public function visibility(string $path): FileAttributes
+    {
+        // TODO: Implement visibility() method.
+        UnableToRetrieveMetadata::visibility($path);
+    }
+
+    public function mimeType(string $path): FileAttributes
+    {
+        // TODO: Implement mimeType() method.
+        try {
+            $object = $this->getObject($path);
+            return $this->normalizeObject($object);
+        } catch( \Throwable $exception) {
+            throw UnableToRetrieveMetadata::mimeType($path);
+        }
+    }
+
+    public function lastModified(string $path): FileAttributes
+    {
+        // TODO: Implement lastModified() method.
+        try {
+            $object = $this->getObject($path);
+            return $this->normalizeObject($object);
+        } catch( \Throwable $exception) {
+            throw UnableToRetrieveMetadata::lastModified($path);
+        }
+    }
+
+    public function copy(string $source, string $destination, Config $config): void
+    {
+        // TODO: Implement copy() method.
+        throw UnableToCopyFile::fromLocationTo($source, $destination);
     }
 }
